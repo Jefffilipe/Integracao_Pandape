@@ -1,0 +1,281 @@
+// Estrutura básica da API de integração Senior-PandaPe
+const express = require('express');
+const axios = require('axios');
+const oracledb = require('oracledb');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const dotenv = require('dotenv');
+
+// Carregar variáveis de ambiente
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// Configurações do banco de dados Oracle
+const dbConfig = {
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  connectString: process.env.DB_CONNECTION_STRING
+};
+
+// Configurações da API PandaPe
+const pandapeConfig = {
+  baseUrl: process.env.PANDAPE_API_URL || 'https://qa3.pandape.infojobs.com.br',
+  clientId: process.env.PANDAPE_CLIENT_ID || 'AtacadaoApiClient',
+  clientSecret: process.env.PANDAPE_CLIENT_SECRET || 'db1d76a77dca4ecb997c'
+};
+
+// Função para obter token de autenticação do PandaPe
+async function getPandaPeToken() {
+  try {
+    const tokenUrl = `${pandapeConfig.baseUrl}/connect/token`;
+    const params = new URLSearchParams();
+    params.append('grant_type', 'client_credentials');
+    params.append('client_id', pandapeConfig.clientId);
+    params.append('client_secret', pandapeConfig.clientSecret);
+    params.append('scope', 'ExternalRequestApi PandapeApi');
+
+    const response = await axios.post(tokenUrl, params, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    return response.data.access_token;
+  } catch (error) {
+    console.error('Erro ao obter token de autenticação:', error.message);
+    throw new Error('Falha na autenticação com o PandaPe');
+  }
+}
+
+// Função para mapear os campos da tabela USU_TIdPanda para o formato do PandaPe
+function mapSeniorToPandaPe(seniorData) {
+  // Mapeamento dos campos conforme documentação
+  return {
+    // Campos obrigatórios para a requisição
+    title: seniorData.USU_TitRed || `Vaga ${seniorData.USU_CodCar}`,
+    quantity: parseInt(seniorData.USU_QtdRqu) || 1,
+    idCompanyArea: null, // Precisa ser definido com base em algum mapeamento
+    idJobTitle: null, // Precisa ser definido com base em algum mapeamento
+    idDepartment: null, // Precisa ser definido com base em algum mapeamento
+    idWorkplace: null, // Precisa ser definido com base em algum mapeamento
+    isConfidential: seniorData.USU_VagCon === 'S' ? true : false,
+    // Campos adicionais
+    customFields: [
+      { idRequestField: 13212, value: seniorData.USU_CodFil || '' }, // Id Loja
+      { idRequestField: 13213, value: seniorData.USU_NomFil || '' }, // Loja
+      { idRequestField: 13214, value: seniorData.USU_EmpFor || '' }, // Formato
+      { idRequestField: 13215, value: seniorData.USU_DesReg || '' }, // Descrição da Posição
+      { idRequestField: 13218, value: seniorData.USU_ObsSal || '' }, // Salário Obs
+      { idRequestField: 13219, value: seniorData.USU_HorPanda || '' }, // Horas
+      { idRequestField: 13220, value: seniorData.USU_CodHor || '' }, // Cod Horário
+      { idRequestField: 13221, value: seniorData.USU_ComHor || '' }, // Composição Horário
+      { idRequestField: 13222, value: seniorData.USU_TipMar || '' }, // Tipo Marcação
+      { idRequestField: 13224, value: seniorData.USU_ComRH || '' }, // Comentário RH
+      { idRequestField: 13225, value: seniorData.USU_DesGru || '' }, // Grupo de Cargo
+      { idRequestField: 13226, value: seniorData.USU_DatRqu || '' }, // Criado em
+      { idRequestField: 13203, value: seniorData.USU_DatApr || '' }, // Aprovado em
+      { idRequestField: 13201, value: seniorData.USU_SitRqu || '' }, // Status Atual da Requisição
+      { idRequestField: 13227, value: seniorData.USU_NumPos || '' }, // N Posição
+      { idRequestField: 13255, value: seniorData.USU_EmaGer || '' }, // E-mail Gestor
+      { idRequestField: 13257, value: seniorData.USU_SisOrg || '' }, // Sistema Origem
+      { idRequestField: 13258, value: seniorData.USU_DesDiv || '' }, // Divisão R&S
+      { idRequestField: 13259, value: seniorData.USU_VagCon || '' }, // Confidencial
+      { idRequestField: 13261, value: seniorData.USU_SLA || '' }, // SLA
+      { idRequestField: 13264, value: seniorData.USU_CodCcu || '' }, // Centro de Custo
+      { idRequestField: 13245, value: seniorData.USU_CodReg || '' }, // Região
+      { idRequestField: 13246, value: seniorData.USU_EstCar || '' }, // UF
+      { idRequestField: 13243, value: seniorData.USU_NumEmp || '' }, // Código da Empresa
+      { idRequestField: 13244, value: seniorData.USU_CodCar || '' }, // Código do Cargo
+      { idRequestField: 13248, value: seniorData.USU_CodCcu || '' }, // Código Depto
+      { idRequestField: 13738, value: seniorData.USU_GesRV || '' }, // GESTOR DA RV
+      { idRequestField: 13202, value: seniorData.USU_GraIns || '' }  // Escolaridade Mínima do Cargo
+    ]
+  };
+}
+
+// Endpoint para verificar novas vagas no Senior e enviar para o PandaPe
+app.get('/api/sync', async (req, res) => {
+  let connection;
+  try {
+    // Conectar ao banco de dados
+    connection = await oracledb.getConnection(dbConfig);
+    
+    // Consultar vagas não enviadas para o PandaPe
+    const result = await connection.execute(
+      `SELECT * FROM USU_TIdPanda WHERE USU_EnvPanda = 'N'`
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ message: 'Nenhuma nova vaga para sincronizar' });
+    }
+    
+    // Obter token de autenticação
+    const token = await getPandaPeToken();
+    
+    // Array para armazenar resultados das operações
+    const syncResults = [];
+    
+    // Processar cada vaga
+    for (const row of result.rows) {
+      // Converter array de colunas em objeto
+      const seniorData = {};
+      result.metaData.forEach((column, index) => {
+        seniorData[column.name] = row[index];
+      });
+      
+      // Mapear dados para o formato do PandaPe
+      const pandapeData = mapSeniorToPandaPe(seniorData);
+      
+      try {
+        // Enviar dados para criar a vaga no PandaPe
+        const response = await axios.post(
+          `${pandapeConfig.baseUrl}/api/v2/requests`,
+          pandapeData,
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        // Atualizar o registro no Senior marcando como enviado
+        await connection.execute(
+          `UPDATE USU_TIdPanda 
+           SET USU_EnvPanda = 'S', 
+               USU_IdPanda = :idPanda 
+           WHERE USU_CodRqu = :codRqu`,
+          {
+            idPanda: response.data.idRequest,
+            codRqu: seniorData.USU_CodRqu
+          }
+        );
+        
+        await connection.commit();
+        
+        syncResults.push({
+          codRqu: seniorData.USU_CodRqu,
+          idPanda: response.data.idRequest,
+          status: 'success'
+        });
+      } catch (error) {
+        console.error(`Erro ao enviar vaga ${seniorData.USU_CodRqu}:`, error.message);
+        syncResults.push({
+          codRqu: seniorData.USU_CodRqu,
+          error: error.message,
+          status: 'error'
+        });
+      }
+    }
+    
+    return res.json({ syncResults });
+  } catch (error) {
+    console.error('Erro ao sincronizar vagas:', error.message);
+    return res.status(500).json({ error: error.message });
+  } finally {
+    if (connection) {
+      try {
+        await connection.close();
+      } catch (error) {
+        console.error('Erro ao fechar conexão:', error.message);
+      }
+    }
+  }
+});
+
+// Endpoint para receber notificações do webhook do PandaPe
+app.post('/api/webhook/candidate-stage', async (req, res) => {
+  try {
+    const { idRequest, idRequestMatch, stageName } = req.body;
+    
+    // Verificar se o candidato está na etapa de CONTRATADOS/FINALISTA
+    if (stageName === 'CONTRATADOS' || stageName === 'FINALISTA') {
+      // Obter token de autenticação
+      const token = await getPandaPeToken();
+      
+      // Obter dados do candidato
+      const candidateResponse = await axios.get(
+        `${pandapeConfig.baseUrl}/api/v2/request-matches/${idRequestMatch}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        }
+      );
+      
+      const candidateData = candidateResponse.data;
+      
+      // Conectar ao banco de dados
+      const connection = await oracledb.getConnection(dbConfig);
+      
+      try {
+        // Buscar a requisição no Senior
+        const result = await connection.execute(
+          `SELECT * FROM USU_TIdPanda WHERE USU_IdPanda = :idPanda`,
+          { idPanda: idRequest }
+        );
+        
+        if (result.rows.length === 0) {
+          console.error(`Requisição não encontrada: ${idRequest}`);
+          return res.status(404).json({ error: 'Requisição não encontrada' });
+        }
+        
+        // Atualizar dados do candidato na tabela
+        await connection.execute(
+          `UPDATE USU_TIdPanda 
+           SET USU_NomCan = :nomeCandidato, 
+               USU_CpfCan = :cpfCandidato,
+               USU_TelCan = :telefoneCandidato,
+               USU_EmaCan = :emailCandidato,
+               USU_DatAdm = :dataAdmissao
+           WHERE USU_IdPanda = :idPanda`,
+          {
+            nomeCandidato: candidateData.name,
+            cpfCandidato: candidateData.documentNumber,
+            telefoneCandidato: candidateData.phone,
+            emailCandidato: candidateData.email,
+            dataAdmissao: new Date(),
+            idPanda: idRequest
+          }
+        );
+        
+        await connection.commit();
+        
+        // Atualizar status da requisição no PandaPe
+        await axios.patch(
+          `${pandapeConfig.baseUrl}/api/v2/requests/${idRequest}`,
+          { closed: true },
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json'
+            }
+          }
+        );
+        
+        return res.json({ success: true, message: 'Candidato processado com sucesso' });
+      } finally {
+        if (connection) {
+          await connection.close();
+        }
+      }
+    } else {
+      // Se não for a etapa final, apenas confirmar recebimento
+      return res.json({ received: true });
+    }
+  } catch (error) {
+    console.error('Erro ao processar webhook:', error.message);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Iniciar o servidor
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
+
+module.exports = app;

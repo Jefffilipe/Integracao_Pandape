@@ -1,0 +1,42 @@
+const oracledb = require('oracledb');
+const { logger } = require('./pandape');
+// Removido: require('dotenv').config() - Já é carregado no index.js
+
+const dbConfig = {
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  connectString: process.env.DB_CONNECTION_STRING,
+  poolMin: 1,
+  poolMax: 10,
+  poolTimeout: 60
+};
+
+// Log para debug
+logger.info('Configuração do banco de dados', {
+  user: dbConfig.user,
+  connectString: dbConfig.connectString,
+  hasPassword: !!dbConfig.password
+});
+
+async function initializePool() {
+  try {
+    if (!dbConfig.connectString) {
+      throw new Error('DB_CONNECTION_STRING está vazio ou indefinido');
+    }
+    await oracledb.createPool(dbConfig);
+    logger.info('Pool de conexão com Oracle criado com sucesso');
+  } catch (err) {
+    logger.error('Erro ao criar pool de conexão', { error: err.message });
+    throw err;
+  }
+}
+
+async function getConnection() {
+  return await oracledb.getConnection();
+}
+
+async function closePool() {
+  await oracledb.getPool().close(10);
+}
+
+module.exports = { initializePool, getConnection, closePool };

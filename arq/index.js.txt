@@ -1,0 +1,53 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const { initializePool, closePool } = require('./config/db');
+const { logger } = require('./config/pandape');
+const apiRoutes = require('./routes/api');
+
+// Carrega o .env com caminho explícito
+const result = dotenv.config({ path: 'D:/SeniorHML/Integracao-PandaPe/.env' });
+
+// Log para verificar se o .env foi carregado
+if (result.error) {
+  logger.error('Erro ao carregar o arquivo .env', { error: result.error.message });
+  throw result.error;
+} else {
+  logger.info('Arquivo .env carregado com sucesso', { parsed: result.parsed });
+}
+
+// Log adicional para verificar as variáveis diretamente
+logger.info('Variáveis de ambiente após carregamento', {
+  DB_USER: process.env.DB_USER,
+  DB_CONNECTION_STRING: process.env.DB_CONNECTION_STRING,
+  hasPassword: !!process.env.DB_PASSWORD
+});
+
+const app = express();
+
+app.use(cors());
+app.use(bodyParser.json());
+app.use('/api', apiRoutes);
+
+const PORT = process.env.PORT || 3000;
+
+async function startServer() {
+  try {
+    await initializePool();
+    app.listen(PORT, () => {
+      logger.info(`Servidor rodando na porta ${PORT}`);
+    });
+  } catch (err) {
+    logger.error('Erro ao iniciar servidor', { error: err.message });
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', async () => {
+  logger.info('Encerrando servidor');
+  await closePool();
+  process.exit(0);
+});
+
+startServer();

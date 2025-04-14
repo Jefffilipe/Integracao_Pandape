@@ -1,0 +1,199 @@
+const express = require('express');
+const axios = require('axios');
+const { getConnection } = require('../config/db');
+const { getPandaPeToken, pandapeConfig, logger } = require('../config/pandape');
+const { mapSeniorToPandaPe } = require('../mappers/seniorToPandape');
+
+const router = express.Router();
+
+// Sincronizar vagas
+router.get('/sync', async (req, res) => {
+  let connection;
+  try {
+    connection = await getConnection();
+    const result = await connection.execute(`SELECT * FROM USU_TIdPanda WHERE USU_EnvPanda = 'N'`);
+    
+    if (!result.rows.length) {
+      logger.info('Nenhuma nova vaga para sincronizar');
+      return res.json({ message: 'Nenhuma nova vaga para sincronizar' });
+    }
+
+    const token = await getPandaPeToken();
+    const syncResults = [];
+
+    for (const row of result.rows) {
+      const seniorData = Object.fromEntries(result.metaData.map((col, i) => [col.name, row[i]]));
+      const pandapeData = mapSeniorToPandaPe(seniorData);
+
+      try {
+        // 1. Criar a requisição no PandaPe
+        const requestResponse = await axios.post(
+          `${pandapeConfig.baseUrl}/api/ExternalRequest/Insert`,
+          pandapeData,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+        );
+
+        const idRequest = requestResponse.data; // Ex.: 410769
+        logger.info('Requisição criada com sucesso', { codRqu: seniorData.USU_CodRqu, idRequest });
+
+        // 2. Criar a vaga associada à requisição
+        const vacancyData = {
+          IdUser: 101074,
+          IdRequestToAssociate: idRequest,
+          Reference: idRequest.toString(),
+          Job: pandapeData.Job,
+          JobComplement: null,
+          IdJob: 1005490, // Fixo por enquanto; ajustar com mapeamento dinâmico
+          IdCategory1: pandapeData.IdCategory1,
+          IdCategory2: pandapeData.IdCategory2,
+          IdManagerialLevel: pandapeData.IdManagerialLevel,
+          Description: pandapeData.Description, // Garantir que tenha entre 150 e 6000 caracteres
+          NumberVacancies: pandapeData.NumberVacancies,
+          IdContractWorkType: 1,
+          IdWorkingHours: 1,
+          IdWorkMethod: 1,
+          SalaryMin: "1000", // Ajustar com dados do Senior
+          SalaryMax: "20000", // Ajustar com dados do Senior
+          HideSalary: true,
+          CEP: null,
+          VacancyLocationType: 0,
+          CompanyHidden: false, // Capmpo obrigatório, numérico
+          AlternativeDescription: null,
+          YoutubeVideoUrl: null,
+          IdStudy1Min: 3, // Ajustar com mapeamento dinâmico
+          CompanyHiddenName: null, // Capmpo obrigatório
+          ContractDate: null,
+          IdExperienceRange: null,
+          AgeMin: null,
+          AgeMax: null,
+          IdSex: null,
+          DeficiencyRequired: false,
+          DeficiencyInformation: null,
+          CIDRequired: false,
+          Deficiencies: [],
+          ChangeResidenceAvailabilityRequired: false,
+          TravelAvailabilityRequired: false,
+          VehicleRequired: false,
+          LicenseRequired: false,
+          IdLicenseList: [],
+          Studies: [],
+          Languages: [],
+          Benefits: [],
+          Skills: [],
+          Tags: [],
+          IdPortal: 40
+        };
+
+        const vacancyResponse = await axios.post(
+          `${pandapeConfig.baseUrl}/api/Vacancy/Insert`,
+          vacancyData,
+          { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+        );
+
+        const idVacancy = vacancyResponse.data; // Ex.: 1928138
+        logger.info('Vaga criada com sucesso', { codRqu: seniorData.USU_CodRqu, idRequest, idVacancy });
+
+        // 3. Atualizar o banco com o ID da requisição
+        await connection.execute(
+          `UPDATE USU_TIdPanda SET USU_EnvPanda = 'S', USU_IdPanda = :idPanda WHERE USU_CodRqu = :codRqu`,
+          { idPanda: idRequest, codRqu: seniorData.USU_CodRqu }
+        );
+        await connection.commit();
+
+        syncResults.push({ codRqu: seniorData.USU_CodRqu, idPanda: idRequest, idVacancy, status: 'success' });
+      } catch (error) {
+        logger.error('Erro ao enviar vaga ao PandaPe', { 
+          codRqu: seniorData.USU_CodRqu, 
+          error: error.response ? error.response.data : error.message 
+        });
+        syncResults.push({ codRqu: seniorData.USU_CodRqu, error: error.message, status: 'error' });
+      }
+    }
+
+    res.json({ syncResults });
+  } catch (error) {
+    logger.error('Erro geral na sincronização', { error: error.message });
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (connection) {
+      try {
+        await connection.close();
+      } catch (error) {
+        logger.error('Erro ao fechar conexão com o banco', { error: error.message });
+      }
+    }
+  }
+});
+
+// Webhook (mantido como está, será ajustado após configuração)
+router.post('/webhook/candidate-stage', async (req, res) => {
+  const { idRequest, idRequestMatch, stageName } = req.body;
+  logger.info('Webhook recebido', { idRequest, idRequestMatch, stageName });
+
+  if (!['CONTRATADOS', 'FINALISTA'].includes(stageName)) {
+    logger.info('Etapa não requer processamento', { stageName });
+    return res.json({ received: true });
+  }
+
+  let connection;
+  try {
+    const token = await getPandaPeToken();
+    const candidateResponse = await axios.get(
+      `${pandapeConfig.baseUrl}/api/v2/request-matches/${idRequestMatch}`,
+      { headers: { 'Authorization': `Bearer ${token}` } }
+    );
+
+    connection = await getConnection();
+    const result = await connection.execute(
+      `SELECT * FROM USU_TIdPanda WHERE USU_IdPanda = :idPanda`,
+      { idPanda: idRequest }
+    );
+
+    if (!result.rows.length) {
+      logger.warn('Requisição não encontrada no banco', { idRequest });
+      return res.status(404).json({ error: 'Requisição não encontrada' });
+    }
+
+    const candidateData = candidateResponse.data;
+    await connection.execute(
+      `UPDATE USU_TIdPanda 
+       SET USU_NomCan = :nome, USU_CpfCan = :cpf, USU_TelCan = :tel, USU_EmaCan = :email, USU_DatAdm = :data
+       WHERE USU_IdPanda = :idPanda`,
+      {
+        nome: candidateData.name,
+        cpf: candidateData.documentNumber,
+        tel: candidateData.phone,
+        email: candidateData.email,
+        data: new Date(),
+        idPanda: idRequest
+      }
+    );
+    await connection.commit();
+
+    await axios.patch(
+      `${pandapeConfig.baseUrl}/api/v2/requests/${idRequest}`,
+      { closed: true },
+      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+
+    logger.info('Candidato processado com sucesso', { idRequest, idRequestMatch });
+    res.json({ success: true, message: 'Candidato processado com sucesso' });
+  } catch (error) {
+    logger.error('Erro ao processar webhook', { 
+      idRequest, 
+      idRequestMatch, 
+      error: error.response ? error.response.data : error.message 
+    });
+    res.status(500).json({ error: error.message });
+  } finally {
+    if (connection) {
+      try {
+        await connection.close();
+      } catch (error) {
+        logger.error('Erro ao fechar conexão no webhook', { error: error.message });
+      }
+    }
+  }
+});
+
+module.exports = router;
